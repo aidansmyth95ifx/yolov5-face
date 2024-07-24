@@ -1,7 +1,7 @@
 # This file contains modules common to various models
 
 import math
-
+import warnings
 import numpy as np
 import requests
 import torch
@@ -11,7 +11,6 @@ from PIL import Image, ImageDraw
 from utils.datasets import letterbox
 from utils.general import non_max_suppression, make_divisible, scale_coords, xyxy2xywh
 from utils.plots import color_list
-import warnings
 
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
@@ -34,6 +33,11 @@ def channel_shuffle(x, groups):
 def DWConv(c1, c2, k=1, s=1, act=True):
     # Depthwise convolution
     return Conv(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
+
+class DWConvTranspose2d(nn.ConvTranspose2d):
+    # Depth-wise transpose convolution
+    def __init__(self, c1, c2, k=1, s=1, p1=0, p2=0):  # ch_in, ch_out, kernel, stride, padding, padding_out
+        super().__init__(c1, c2, k, s, p1, p2, groups=math.gcd(c1, c2))
 
 class Conv(nn.Module):
     # Standard convolution
@@ -67,6 +71,7 @@ class StemBlock(nn.Module):
         out = self.stem_3(torch.cat((stem_2b_out,stem_2p_out),1))
         return out
 
+
 class Bottleneck(nn.Module):
     # Standard bottleneck
     def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
@@ -98,6 +103,20 @@ class BottleneckCSP(nn.Module):
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), dim=1))))
 
 
+class CrossConv(nn.Module):
+    # Cross Convolution Downsample
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+        # ch_in, ch_out, kernel, stride, groups, expansion, shortcut
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, (1, k), (1, s))
+        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
@@ -110,6 +129,39 @@ class C3(nn.Module):
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+
+
+class C3x(C3):
+    # C3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)))
+
+
+class C3TR(C3):
+    # C3 module with TransformerBlock()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = TransformerBlock(c_, c_, 4, n)
+
+
+class C3SPP(C3):
+    # C3 module with SPP()
+    def __init__(self, c1, c2, k=(5, 9, 13), n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = SPP(c_, c_, k)
+
+
+class C3Ghost(C3):
+    # C3 module with GhostBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
+
 
 class ShuffleV2Block(nn.Module):
     def __init__(self, inp, oup, stride):
@@ -156,6 +208,7 @@ class ShuffleV2Block(nn.Module):
             out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
         out = channel_shuffle(out, 2)
         return out
+
     
 class BlazeBlock(nn.Module):
     def __init__(self, in_channels,out_channels,mid_channels=None,stride=1):
@@ -303,7 +356,8 @@ class Concat(nn.Module):
         self.d = dimension
 
     def forward(self, x):
-        return torch.cat(x, self.d)
+        x = torch.cat(x, self.d)
+        return x
 
 
 class NMS(nn.Module):
